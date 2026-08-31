@@ -70,12 +70,6 @@ struct ATMMGGraphConfig {
     size_t cluster_route_leaf_size = 8;
     size_t cluster_route_iters = 4;
 
-    size_t center_real_pool_size = 256;
-    size_t center_real_pool_take = 48;
-    size_t center_real_pool_trigger_topk = 100;
-    bool center_real_pool_monotonic = true;
-    bool center_real_pool_force = false;
-
     size_t center_topn_scan = 2000;
     size_t center_topn_probe = 0;
     size_t center_topn_coarse_keep = 96;
@@ -124,10 +118,6 @@ struct ATMMGGraphConfig {
     size_t graph_insert_new_degree = 0;
     bool graph_search_use_quant = false;
     bool graph_search_full_quant = false;
-    bool graph_search_use_u8_l2 = false;
-    float graph_u8_clip_low_percentile = 0.0F;
-    float graph_u8_clip_high_percentile = 100.0F;
-    size_t graph_u8_clip_sample_size = 1000000;
     // Compatibility placeholder. Effective rerank count is always the query's k.
     size_t graph_rerank_candidates = 0;
     bool graph_early_stop = false;
@@ -151,7 +141,6 @@ struct ATMMGGraphConfig {
     bool graph_lazy_center_distance = false;
     bool graph_distance_use_norm_dot = false;
     size_t graph_build_mode = 0;  // 0=insertion, 1=nsg, 2=vamana
-    bool graph_build_use_u8_l2 = false;
     float graph_vamana_alpha = 1.2F;
     size_t graph_vamana_candidate_limit = 0;
     bool graph_post_nnd_refine = false;
@@ -202,7 +191,6 @@ struct ATMMGGraphConfig {
 };
 
 enum class SeedMode : uint8_t {
-    CenterRealPool,
     Fallback
 };
 
@@ -344,7 +332,6 @@ struct BatchStats {
     TimeSummary graph_search_ms;
     TimeSummary final_select_ms;
     size_t fallback_count = 0;
-    size_t center_real_pool = 0;
     size_t trigger_pass_count = 0;
 
     void add(const QueryStats& stats) {
@@ -393,9 +380,6 @@ struct BatchStats {
         final_select_ms.add(stats.final_select_ms);
         fallback_count += stats.fallback ? 1 : stats.fallback_count;
         trigger_pass_count += stats.trigger_pass ? 1 : stats.trigger_pass_count;
-        if (stats.init_mode == SeedMode::CenterRealPool) {
-            ++center_real_pool;
-        }
     }
 };
 
@@ -952,10 +936,6 @@ class ATMMGGraphIndex {
 
     std::vector<float> base_;
     std::vector<float> base_sq_norms_;
-    std::vector<uint8_t> base_u8_;
-    std::vector<float> base_u8_min_;
-    std::vector<float> base_u8_scale_;
-    bool base_u8_identity_quantization_ = false;
     std::vector<float> rotated_base_;
     std::vector<float> centers_;
     std::vector<float> center_sq_norms_;
@@ -981,7 +961,6 @@ class ATMMGGraphIndex {
     std::vector<std::vector<PID>> leaf_ids_;
     std::vector<PID> point_center_;
 
-    std::vector<std::vector<PID>> center_real_pool_;
     std::vector<std::vector<PID>> center_topn_;
     std::vector<std::vector<PID>> center_neighbors_;
     std::vector<std::vector<PID>> center_portal_pool_;
@@ -1026,7 +1005,6 @@ class ATMMGGraphIndex {
     std::vector<PID> graph_dual_long_indices_;
     std::vector<uint16_t> graph_dual_long_counts_;
     std::vector<float> graph_dual_short_radius_;
-    std::vector<float> graph_dual_short_u8_radius_;
     size_t graph_dual_short_neighbor_count_ = 0;
     size_t graph_dual_long_neighbor_count_ = 0;
     size_t graph_bridge_edges_added_ = 0;
@@ -1073,7 +1051,6 @@ class ATMMGGraphIndex {
     void quantize_topn_codes();
     void quantize_point_codes();
     void quantize_graph_edge_batch_codes();
-    void build_u8_codes();
     void build_graph();
     void build_graph_insertion();
     void build_graph_nsg();
@@ -1090,7 +1067,6 @@ class ATMMGGraphIndex {
     size_t search_fast_into(const float* query, size_t k, PID* out_ids) const;
     bool uses_center_quant_refine() const;
     bool can_use_exact_l2_light_fast_path() const;
-    bool can_use_u8_l2_light_fast_path() const;
     std::vector<PID> search_exact_l2_light_fast(
         const float* query,
         size_t k,
@@ -1110,25 +1086,6 @@ class ATMMGGraphIndex {
         const std::vector<PID>& seeds,
         PID best_center,
         ATMMGGraphQueryStats& local_stats
-    ) const;
-    std::vector<PID> search_u8_l2_light_fast(
-        const float* query,
-        float query_sq_norm,
-        size_t k,
-        const std::vector<PID>& seeds,
-        PID best_center,
-        float center_margin,
-        size_t ef_override = 0
-    ) const;
-    size_t search_u8_l2_light_fast_into(
-        const float* query,
-        float query_sq_norm,
-        size_t k,
-        const std::vector<PID>& seeds,
-        PID best_center,
-        float center_margin,
-        PID* out_ids,
-        size_t ef_override = 0
     ) const;
     size_t adaptive_center_budget(
         size_t default_budget,
@@ -1354,84 +1311,6 @@ class ATMMGGraphIndex {
         return std::max(dist, 0.0F);
     }
 
-    void encode_query_u8_to_buffer(const float* query, uint8_t* query_u8) const {
-        if (base_u8_identity_quantization_) {
-            for (size_t d = 0; d < dim_; ++d) {
-                int value = static_cast<int>(query[d] + 0.5F);
-                if (static_cast<unsigned int>(value) > 255U) {
-                    value = value < 0 ? 0 : 255;
-                }
-                query_u8[d] = static_cast<uint8_t>(value);
-            }
-            return;
-        }
-        if (base_u8_scale_.empty()) {
-            for (size_t d = 0; d < dim_; ++d) {
-                float value = std::round(std::max(0.0F, std::min(255.0F, query[d])));
-                query_u8[d] = static_cast<uint8_t>(value);
-            }
-            return;
-        }
-        for (size_t d = 0; d < dim_; ++d) {
-            float encoded = (query[d] - base_u8_min_[d]) * base_u8_scale_[d];
-            encoded = std::round(std::max(0.0F, std::min(255.0F, encoded)));
-            query_u8[d] = static_cast<uint8_t>(encoded);
-        }
-    }
-
-    void encode_query_u8(const float* query, std::vector<uint8_t>& query_u8) const {
-        query_u8.resize(dim_);
-        encode_query_u8_to_buffer(query, query_u8.data());
-    }
-
-    float u8_l2_raw(const uint8_t* a, const uint8_t* b) const {
-#if defined(__AVX2__)
-        if (dim_ == 128) {
-            __m256i acc = _mm256_setzero_si256();
-            for (size_t i = 0; i < 128; i += 32) {
-                __m256i q = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(a + i)
-                );
-                __m256i x = _mm256_loadu_si256(
-                    reinterpret_cast<const __m256i*>(b + i)
-                );
-
-                __m128i q_lo8 = _mm256_castsi256_si128(q);
-                __m128i q_hi8 = _mm256_extracti128_si256(q, 1);
-                __m128i x_lo8 = _mm256_castsi256_si128(x);
-                __m128i x_hi8 = _mm256_extracti128_si256(x, 1);
-
-                __m256i q_lo = _mm256_cvtepu8_epi16(q_lo8);
-                __m256i q_hi = _mm256_cvtepu8_epi16(q_hi8);
-                __m256i x_lo = _mm256_cvtepu8_epi16(x_lo8);
-                __m256i x_hi = _mm256_cvtepu8_epi16(x_hi8);
-
-                __m256i diff_lo = _mm256_sub_epi16(q_lo, x_lo);
-                __m256i diff_hi = _mm256_sub_epi16(q_hi, x_hi);
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff_lo, diff_lo));
-                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(diff_hi, diff_hi));
-            }
-            __m128i lo = _mm256_castsi256_si128(acc);
-            __m128i hi = _mm256_extracti128_si256(acc, 1);
-            __m128i sum = _mm_add_epi32(lo, hi);
-            sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
-            sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
-            return static_cast<float>(_mm_cvtsi128_si32(sum));
-        }
-#endif
-        uint32_t sum = 0;
-        for (size_t d = 0; d < dim_; ++d) {
-            int diff = static_cast<int>(a[d]) - static_cast<int>(b[d]);
-            sum += static_cast<uint32_t>(diff * diff);
-        }
-        return static_cast<float>(sum);
-    }
-
-    float u8_l2_to_point(const uint8_t* query_u8, PID id) const {
-        const uint8_t* point = base_u8_.data() + (static_cast<size_t>(id) * dim_);
-        return u8_l2_raw(query_u8, point);
-    }
-
     float l2_to_center(const float* query, PID center) const {
         return euclidean_sqr_fast(
             query, centers_.data() + (static_cast<size_t>(center) * dim_), dim_
@@ -1531,28 +1410,6 @@ class ATMMGGraphIndex {
 #endif
     }
 
-    void prefetch_u8_point(PID id) const {
-#if defined(__GNUC__) || defined(__clang__)
-        const char* ptr = reinterpret_cast<const char*>(
-            base_u8_.data() + (static_cast<size_t>(id) * dim_)
-        );
-        __builtin_prefetch(ptr, 0, 1);
-        if (dim_ > 64) {
-            __builtin_prefetch(ptr + 64, 0, 1);
-        }
-#elif defined(_MSC_VER)
-        const char* ptr = reinterpret_cast<const char*>(
-            base_u8_.data() + (static_cast<size_t>(id) * dim_)
-        );
-        _mm_prefetch(ptr, _MM_HINT_T0);
-        if (dim_ > 64) {
-            _mm_prefetch(ptr + 64, _MM_HINT_T0);
-        }
-#else
-        (void)id;
-#endif
-    }
-
     uint64_t hash_spectrum_code(PID center, const float* rotated_vec) const;
     static uint32_t popcount64(uint64_t value);
     uint32_t hash_spectrum_segment_min(uint64_t a, uint64_t b) const;
@@ -1576,11 +1433,6 @@ class ATMMGGraphIndex {
     bool residual_hash_pass(const uint64_t* query_code, const uint64_t* edge_code) const;
 
     float point_point_l2(PID a, PID b) const {
-        if (config_.graph_build_use_u8_l2 && !base_u8_.empty()) {
-            const uint8_t* pa = base_u8_.data() + (static_cast<size_t>(a) * dim_);
-            const uint8_t* pb = base_u8_.data() + (static_cast<size_t>(b) * dim_);
-            return u8_l2_raw(pa, pb);
-        }
         if (!config_.graph_distance_use_norm_dot) {
             return euclidean_sqr_fast(
                 base_.data() + (static_cast<size_t>(a) * dim_),

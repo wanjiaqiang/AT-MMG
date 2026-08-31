@@ -10,9 +10,6 @@ inline void ATMMGGraphIndex::construct(const float* base, size_t num, size_t dim
     external_ids_.resize(num_);
     std::iota(external_ids_.begin(), external_ids_.end(), static_cast<PID>(0));
     base_sq_norms_.clear();
-    base_u8_.clear();
-    base_u8_min_.clear();
-    base_u8_scale_.clear();
     query_adaptive_l1_ready_ = false;
     query_adaptive_l1_low_ = 0.0F;
     query_adaptive_l1_high_ = 0.0F;
@@ -114,18 +111,8 @@ inline void ATMMGGraphIndex::construct(const float* base, size_t num, size_t dim
     if (config_.graph_search_use_quant && !config_.graph_reorder_by_center) {
         quantize_point_codes();
     }
-    bool needs_pre_graph_u8 =
-        config_.graph_build_use_u8_l2 ||
-        (config_.graph_search_use_u8_l2 && !config_.graph_reorder_by_center);
-    if (needs_pre_graph_u8) {
-        build_u8_codes();
-    }
     build_graph();
     apply_graph_post_nnd_refine();
-    if (config_.graph_search_use_u8_l2 &&
-        (config_.graph_reorder_by_center || base_u8_.empty())) {
-        build_u8_codes();
-    }
     build_residual_hash_spectrum();
     build_residual_hash_bucket_graph();
     visit_marks_.assign(num_, 0);
@@ -587,17 +574,11 @@ inline void ATMMGGraphIndex::rotate_base_and_centers() {
 
 inline void ATMMGGraphIndex::build_center_pools() {
     size_t centers_count = num_centers();
-    center_real_pool_.assign(centers_count, {});
     center_topn_.assign(centers_count, {});
-    center_pool_trigger_d2_.assign(
-        centers_count, std::numeric_limits<float>::infinity()
-    );
 
     size_t max_keep = std::max(
-        {config_.center_real_pool_size,
-         config_.graph_portal_pool_size,
-         config_.center_topn_scan,
-         config_.center_real_pool_trigger_topk}
+        {config_.graph_portal_pool_size, config_.center_topn_scan,
+         config_.center_topn_coarse_keep}
     );
     max_keep = std::min(max_keep, num_);
 
@@ -612,60 +593,10 @@ inline void ATMMGGraphIndex::build_center_pools() {
         }
         keep_smallest(scored, max_keep);
 
-        size_t real_keep = std::min(config_.center_real_pool_size, scored.size());
-        center_real_pool_[c].reserve(real_keep);
-        if (config_.center_real_pool_monotonic && real_keep > 1) {
-            size_t scan_keep = std::min(scored.size(), config_.center_real_pool_size);
-            for (size_t i = 0; i < scan_keep && center_real_pool_[c].size() < real_keep;
-                 ++i) {
-                PID cand_id = scored[i].id;
-                const float cand_center_d2 = scored[i].distance;
-                const float* cand = base_.data() + (static_cast<size_t>(cand_id) * dim_);
-                bool occluded = false;
-                for (PID selected_id : center_real_pool_[c]) {
-                    const float* selected =
-                        base_.data() + (static_cast<size_t>(selected_id) * dim_);
-                    if (euclidean_sqr<float>(cand, selected, dim_) <= cand_center_d2) {
-                        occluded = true;
-                        break;
-                    }
-                }
-                if (!occluded) {
-                    center_real_pool_[c].push_back(cand_id);
-                }
-            }
-            for (const auto& cand : scored) {
-                if (center_real_pool_[c].size() >= real_keep) {
-                    break;
-                }
-                if (std::find(
-                        center_real_pool_[c].begin(),
-                        center_real_pool_[c].end(),
-                        cand.id
-                    ) == center_real_pool_[c].end()) {
-                    center_real_pool_[c].push_back(cand.id);
-                }
-            }
-        } else {
-            for (size_t i = 0; i < real_keep; ++i) {
-                center_real_pool_[c].push_back(scored[i].id);
-            }
-        }
-
         size_t topn_keep = std::min(config_.center_topn_scan, scored.size());
         center_topn_[c].reserve(topn_keep);
         for (size_t i = 0; i < topn_keep; ++i) {
             center_topn_[c].push_back(scored[i].id);
-        }
-
-        if (config_.center_real_pool_force) {
-            center_pool_trigger_d2_[c] = std::numeric_limits<float>::infinity();
-        } else {
-            size_t trigger_keep =
-                std::min(config_.center_real_pool_trigger_topk, scored.size());
-            center_pool_trigger_d2_[c] =
-                trigger_keep == 0 ? -std::numeric_limits<float>::infinity()
-                                  : scored[trigger_keep - 1].distance;
         }
     }
 }
@@ -1852,92 +1783,6 @@ inline void ATMMGGraphIndex::quantize_graph_edge_batch_codes() {
     }
 }
 
-inline void ATMMGGraphIndex::build_u8_codes() {
-    base_u8_.clear();
-    base_u8_min_.clear();
-    base_u8_scale_.clear();
-    base_u8_identity_quantization_ = false;
-    if (num_ == 0 || dim_ == 0) {
-        return;
-    }
-
-    float global_min = std::numeric_limits<float>::max();
-    float global_max = std::numeric_limits<float>::lowest();
-    for (size_t i = 0; i < num_; ++i) {
-        const float* point = base_.data() + (i * dim_);
-        for (size_t d = 0; d < dim_; ++d) {
-            global_min = std::min(global_min, point[d]);
-            global_max = std::max(global_max, point[d]);
-        }
-    }
-
-    float clip_low = std::max(
-        0.0F,
-        std::min(100.0F, config_.graph_u8_clip_low_percentile)
-    );
-    float clip_high = std::max(
-        0.0F,
-        std::min(100.0F, config_.graph_u8_clip_high_percentile)
-    );
-    if (clip_high < clip_low) {
-        std::swap(clip_low, clip_high);
-    }
-    if ((clip_low > 0.0F || clip_high < 100.0F) && num_ * dim_ > 0) {
-        const size_t total_values = num_ * dim_;
-        size_t sample_target = config_.graph_u8_clip_sample_size == 0
-                                   ? total_values
-                                   : std::min(total_values, config_.graph_u8_clip_sample_size);
-        sample_target = std::max<size_t>(1, sample_target);
-        const size_t stride = std::max<size_t>(1, total_values / sample_target);
-
-        std::vector<float> samples;
-        samples.reserve(sample_target + 1);
-        for (size_t i = 0; i < total_values; i += stride) {
-            samples.push_back(base_[i]);
-        }
-        if (samples.empty() || samples.back() != base_.back()) {
-            samples.push_back(base_.back());
-        }
-
-        auto percentile = [&](float pct) {
-            if (samples.empty()) {
-                return 0.0F;
-            }
-            double rank = static_cast<double>(pct) * 0.01 *
-                          static_cast<double>(samples.size() - 1);
-            size_t kth = static_cast<size_t>(std::llround(rank));
-            kth = std::min(kth, samples.size() - 1);
-            std::nth_element(samples.begin(), samples.begin() + kth, samples.end());
-            return samples[kth];
-        };
-
-        float clipped_min = percentile(clip_low);
-        float clipped_max = percentile(clip_high);
-        if (clipped_max > clipped_min) {
-            global_min = clipped_min;
-            global_max = clipped_max;
-        }
-    }
-
-    float range = global_max - global_min;
-    float global_scale = range > 1e-6F ? (255.0F / range) : 1.0F;
-    base_u8_min_.assign(dim_, global_min);
-    base_u8_scale_.assign(dim_, global_scale);
-    base_u8_identity_quantization_ =
-        std::fabs(global_min) <= 1e-6F && std::fabs(global_scale - 1.0F) <= 1e-6F;
-
-    base_u8_.resize(num_ * dim_);
-    for (size_t i = 0; i < num_; ++i) {
-        const float* point = base_.data() + (i * dim_);
-        uint8_t* encoded_point = base_u8_.data() + (i * dim_);
-        for (size_t d = 0; d < dim_; ++d) {
-            float encoded = (point[d] - base_u8_min_[d]) * base_u8_scale_[d];
-            encoded = std::round(std::max(0.0F, std::min(255.0F, encoded)));
-            encoded_point[d] = static_cast<uint8_t>(encoded);
-        }
-    }
-}
-
 inline void ATMMGGraphIndex::build_graph_insertion() {
     graph_.assign(num_, {});
     if (num_ <= 1) {
@@ -2387,7 +2232,7 @@ inline void ATMMGGraphIndex::build_graph_nsg() {
         }
 
         if (candidates.empty()) {
-            const auto& fallback_pool = center_real_pool_[center_id];
+            const auto& fallback_pool = center_topn_[center_id];
             for (PID cand : fallback_pool) {
                 append_candidate(candidates, cand, id, epoch);
                 if (!candidates.empty()) {
@@ -2414,7 +2259,7 @@ inline void ATMMGGraphIndex::build_graph_nsg() {
         }
         if (row.empty() && num_ > 1) {
             PID center_id = point_center_[id];
-            for (PID cand : center_real_pool_[center_id]) {
+            for (PID cand : center_topn_[center_id]) {
                 if (cand != id) {
                     append_graph_edge(id, cand);
                     break;
@@ -3313,7 +3158,7 @@ inline void ATMMGGraphIndex::reorder_graph_by_center() {
     for (auto& ids : leaf_ids_) {
         remap_ids(ids);
     }
-    for (auto& ids : center_real_pool_) {
+    for (auto& ids : center_topn_) {
         remap_ids(ids);
     }
     for (auto& ids : center_topn_) {
@@ -3447,7 +3292,6 @@ inline void ATMMGGraphIndex::rebuild_dual_scale_neighbors() {
     graph_dual_long_indices_.clear();
     graph_dual_long_counts_.clear();
     graph_dual_short_radius_.clear();
-    graph_dual_short_u8_radius_.clear();
     graph_dual_short_neighbor_count_ = 0;
     graph_dual_long_neighbor_count_ = 0;
 
@@ -3472,7 +3316,6 @@ inline void ATMMGGraphIndex::rebuild_dual_scale_neighbors() {
     graph_dual_short_counts_.assign(num_, 0);
     graph_dual_long_counts_.assign(num_, 0);
     graph_dual_short_radius_.assign(num_, 0.0F);
-    graph_dual_short_u8_radius_.assign(num_, 0.0F);
     graph_dual_short_indices_.assign(num_ * short_count, PID{0});
     graph_dual_long_indices_.assign(num_ * long_count, PID{0});
 
@@ -3498,20 +3341,11 @@ inline void ATMMGGraphIndex::rebuild_dual_scale_neighbors() {
         graph_dual_short_counts_[i] = static_cast<uint16_t>(actual_short);
         PID* short_dst = graph_dual_short_indices_.data() + (i * short_count);
         float radius = 0.0F;
-        float u8_radius = 0.0F;
-        const uint8_t* src_u8 = base_u8_.empty()
-                                    ? nullptr
-                                    : base_u8_.data() +
-                                          (static_cast<size_t>(src) * dim_);
         for (size_t s = 0; s < actual_short; ++s) {
             short_dst[s] = row_scores[s].id;
             radius = std::max(radius, row_scores[s].distance);
-            if (src_u8 != nullptr) {
-                u8_radius = std::max(u8_radius, u8_l2_to_point(src_u8, row_scores[s].id));
-            }
         }
         graph_dual_short_radius_[i] = radius;
-        graph_dual_short_u8_radius_[i] = u8_radius;
 
         if (row_scores.size() <= actual_short) {
             continue;
@@ -3549,3 +3383,4 @@ inline void ATMMGGraphIndex::rebuild_dual_scale_neighbors() {
         graph_dual_long_counts_[i] = static_cast<uint16_t>(actual_long);
     }
 }
+

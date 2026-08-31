@@ -220,8 +220,6 @@ void force_mainline_only(ATMMG::Config& config) {
     config.use_residual_hash_bucket_graph = false;
     config.graph_search_use_quant = false;
     config.graph_search_full_quant = false;
-    config.graph_search_use_u8_l2 = false;
-    config.graph_build_use_u8_l2 = false;
     config.graph_early_stop = false;
     config.graph_result_margin_stop = false;
     config.graph_admission_bound = false;
@@ -326,11 +324,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
     config.center_cascade_low_keep = 0;
     config.center_cascade_mid_keep = 0;
     config.center_cascade_use_nth = false;
-    config.center_real_pool_size = 256;
-    config.center_real_pool_take = 48;
-    config.center_real_pool_trigger_topk = 100;
-    config.center_real_pool_monotonic = true;
-    config.center_real_pool_force = false;
     config.center_topn_scan = 2000;
     config.center_topn_probe = 0;
     config.center_topn_coarse_keep = 96;
@@ -391,7 +384,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
     config.graph_lazy_center_distance = false;
     config.graph_distance_use_norm_dot = false;
     config.graph_build_mode = 0;
-    config.graph_build_use_u8_l2 = false;
     config.graph_vamana_alpha = 1.2F;
     config.graph_vamana_candidate_limit = 0;
     config.graph_build_bridge_edges = false;
@@ -401,7 +393,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
     config.graph_query_adjacency_order = false;
     config.graph_query_front_prune = false;
     config.graph_reorder_by_center = false;
-    config.graph_search_use_u8_l2 = false;
     config.graph_portal_pool_size = 0;
     config.graph_hot_neighbor_count = 0;
     config.graph_cold_neighbor_count = 0;
@@ -519,9 +510,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
     if (argc > 42) {
         config.graph_early_stop_slack = static_cast<float>(std::atof(argv[42]));
     }
-    if (argc > 43) {
-        config.graph_search_use_u8_l2 = std::strtoull(argv[43], nullptr, 10) != 0;
-    }
     if (argc > 44) {
         config.graph_query_front_prune = std::strtoull(argv[44], nullptr, 10) != 0;
     }
@@ -604,9 +592,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
     if (argc > 66) {
         config.graph_vamana_candidate_limit =
             static_cast<size_t>(std::strtoull(argv[66], nullptr, 10));
-    }
-    if (argc > 67) {
-        config.graph_build_use_u8_l2 = std::strtoull(argv[67], nullptr, 10) != 0;
     }
     if (argc > 68) {
         config.graph_query_adaptive_ef_min =
@@ -933,11 +918,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
     env_u64("ATMMG_GRAPH_DEGREE", config.graph_degree);
     env_u64("ATMMG_EF_SEARCH", config.ef_search);
     env_u64("ATMMG_GRAPH_SEARCH_NEIGHBOR_CAP", config.graph_search_neighbor_cap);
-    env_u64("ATMMG_CENTER_REAL_POOL_SIZE", config.center_real_pool_size);
-    env_u64("ATMMG_CENTER_REAL_POOL_TAKE", config.center_real_pool_take);
-    env_u64("ATMMG_CENTER_REAL_POOL_TRIGGER_TOPK", config.center_real_pool_trigger_topk);
-    env_bool("ATMMG_CENTER_REAL_POOL_MONOTONIC", config.center_real_pool_monotonic);
-    env_bool("ATMMG_CENTER_REAL_POOL_FORCE", config.center_real_pool_force);
     env_u64("ATMMG_CENTER_TOPN_PROBE", config.center_topn_probe);
     env_u64("ATMMG_INIT_KEEP", config.init_keep);
     env_bool("ATMMG_GRAPH_BUILD_BRIDGE_EDGES", config.graph_build_bridge_edges);
@@ -945,8 +925,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
     env_u64("ATMMG_GRAPH_BRIDGE_POINTS_PER_CENTER", config.graph_bridge_points_per_center);
     env_u64("ATMMG_GRAPH_BRIDGE_CANDIDATE_SCAN", config.graph_bridge_candidate_scan);
     env_bool("ATMMG_GRAPH_REORDER_BY_CENTER", config.graph_reorder_by_center);
-    env_bool("ATMMG_GRAPH_SEARCH_USE_U8_L2", config.graph_search_use_u8_l2);
-    env_bool("ATMMG_GRAPH_BUILD_USE_U8_L2", config.graph_build_use_u8_l2);
     env_bool("ATMMG_GRAPH_POST_NND_REFINE", config.graph_post_nnd_refine);
     env_u64("ATMMG_GRAPH_POST_NND_ITERATIONS", config.graph_post_nnd_iterations);
     env_u64(
@@ -1075,10 +1053,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
         std::cout << "eval_exact=" << eval_exact_ms << " ms\n";
         std::cout << "eval_exact_avg=" << eval_exact_avg_ms << " ms\n";
         std::cout << "query_fast_path=" << (use_fast_query ? 1 : 0) << '\n';
-        std::cout << "graph_search_use_u8_l2="
-                  << (index.config().graph_search_use_u8_l2 ? 1 : 0) << '\n';
-        std::cout << "graph_build_use_u8_l2="
-                  << (index.config().graph_build_use_u8_l2 ? 1 : 0) << '\n';
         std::cout << "sweep=1\n";
         std::cout
             << "sweep_csv=ef_search,effective_rerank_candidates,"
@@ -1309,7 +1283,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
         print_stat_avg_max_if_nonzero(
             "graph_cold_edges_scanned", batch_stats.graph_cold_edges_scanned
         );
-        std::cout << "center_real_pool=" << batch_stats.center_real_pool << '\n';
         std::cout << "trigger_pass_count=" << batch_stats.trigger_pass_count << '\n';
         std::cout << "time breakdown\n";
         print_time_avg_max("query_total", batch_stats.query_total_ms);
@@ -1329,16 +1302,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
                   << effective_config.center_cascade_mid_keep << '\n';
         std::cout << "center_entry_mode_name="
                   << center_entry_mode_name(effective_config.center_entry_mode) << '\n';
-        std::cout << "center_real_pool_size="
-                  << effective_config.center_real_pool_size << '\n';
-        std::cout << "center_real_pool_take="
-                  << effective_config.center_real_pool_take << '\n';
-        std::cout << "center_real_pool_trigger_topk="
-                  << effective_config.center_real_pool_trigger_topk << '\n';
-        std::cout << "center_real_pool_monotonic="
-                  << (effective_config.center_real_pool_monotonic ? 1 : 0) << '\n';
-        std::cout << "center_real_pool_force="
-                  << (effective_config.center_real_pool_force ? 1 : 0) << '\n';
         std::cout << "center_topn_scan="
                   << effective_config.center_topn_scan << '\n';
         std::cout << "center_topn_probe="
@@ -1479,10 +1442,6 @@ int run_ATMMG_hdf5(int argc, char** argv) {
                   << effective_config.hard_query_late_neighbor_after << '\n';
         std::cout << "hard_query_rerank_candidates="
                   << effective_config.hard_query_rerank_candidates << '\n';
-        std::cout << "graph_search_use_u8_l2="
-                  << (effective_config.graph_search_use_u8_l2 ? 1 : 0) << '\n';
-        std::cout << "graph_build_use_u8_l2="
-                  << (effective_config.graph_build_use_u8_l2 ? 1 : 0) << '\n';
     }
 
     std::cout << "ANNB recall@" << k_eval << "=" << annb_recall << '\n';

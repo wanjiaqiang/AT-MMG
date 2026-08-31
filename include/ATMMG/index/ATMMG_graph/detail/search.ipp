@@ -82,13 +82,13 @@ inline std::vector<PID> ATMMGGraphIndex::search(
     local_stats.best_center = best_center;
 
     std::vector<PID> seeds;
-    local_stats.mode = SeedMode::CenterRealPool;
-    local_stats.init_mode = SeedMode::CenterRealPool;
+    local_stats.mode = SeedMode::Fallback;
+    local_stats.init_mode = SeedMode::Fallback;
     local_stats.trigger_pass = true;
     local_stats.trigger_pass_count = 1;
-    if (best_center < center_real_pool_.size()) {
-        const auto& pool = center_real_pool_[best_center];
-        size_t take = std::min(config_.center_real_pool_take, pool.size());
+    if (best_center < center_topn_.size()) {
+        const auto& pool = center_topn_[best_center];
+        size_t take = std::min(config_.center_topn_coarse_keep, pool.size());
         local_stats.entry_points_raw = pool.size();
         local_stats.entry_points_before_cap = pool.size();
         local_stats.entry_points_after_cap = take;
@@ -146,11 +146,6 @@ inline std::vector<PID> ATMMGGraphIndex::search(
             local_stats.exact_distance_evals += centers_count;
         }
     }
-    std::vector<uint8_t> query_u8;
-    if (config_.graph_search_use_u8_l2 && !base_u8_.empty() &&
-        !config_.graph_search_use_quant) {
-        encode_query_u8(query, query_u8);
-    }
     const bool residual_filter_ready = residual_hash_ready();
     std::array<float, 512> residual_prepared_query{};
     bool residual_query_prepared = false;
@@ -174,9 +169,6 @@ inline std::vector<PID> ATMMGGraphIndex::search(
     auto graph_distance = [&](PID id) {
         ++local_stats.graph_distance_evals;
         if (!config_.graph_search_use_quant) {
-            if (!query_u8.empty()) {
-                return u8_l2_to_point(query_u8.data(), id);
-            }
             ++local_stats.exact_distance_evals;
             return l2_to_point(query, query_sq_norm, id);
         }
@@ -260,7 +252,7 @@ inline std::vector<PID> ATMMGGraphIndex::search(
         ++local_stats.fallback_count;
         local_stats.fallback = true;
         local_stats.mode = SeedMode::Fallback;
-        PID fallback = center_real_pool_[best_center].empty() ? 0 : center_real_pool_[best_center][0];
+        PID fallback = center_topn_[best_center].empty() ? 0 : center_topn_[best_center][0];
         visit_marks_[fallback] = visit_epoch;
         ++local_stats.visited_nodes;
         float dist = graph_distance(fallback);
@@ -315,8 +307,7 @@ inline std::vector<PID> ATMMGGraphIndex::search(
     bool use_neighbor_prefilter =
         config_.graph_neighbor_prefilter_keep > 0 && !graph_prefilter_dims_.empty();
     bool use_result_margin_stop =
-        config_.graph_result_margin_stop && !config_.graph_search_use_quant &&
-        query_u8.empty();
+        config_.graph_result_margin_stop && !config_.graph_search_use_quant;
     std::vector<ScoredPid> neighbor_prefilter;
     if (use_neighbor_prefilter) {
         size_t reserve_cap = effective_neighbor_cap == 0
@@ -648,7 +639,7 @@ inline std::vector<PID> ATMMGGraphIndex::search(
 
     auto final_begin = profile_now();
     std::vector<PID> result;
-    bool needs_exact_rerank = config_.graph_search_use_quant || !query_u8.empty();
+    bool needs_exact_rerank = config_.graph_search_use_quant;
     if (needs_exact_rerank) {
         size_t rerank_keep = std::min(seen.size(), k);
         keep_smallest(seen, rerank_keep);
@@ -715,22 +706,13 @@ inline bool ATMMGGraphIndex::uses_center_quant_refine() const {
 
 inline bool ATMMGGraphIndex::can_use_exact_l2_light_fast_path() const {
     return !config_.graph_search_use_quant &&
-           !config_.graph_search_use_u8_l2 && !config_.graph_distance_use_norm_dot &&
+           !config_.graph_distance_use_norm_dot &&
            !config_.graph_early_stop && config_.graph_adaptive_ef_min == 0 &&
            config_.graph_query_adaptive_ef_min == 0 &&
            !config_.hard_query_fallback &&
            !config_.graph_result_margin_stop && !config_.graph_admission_bound &&
            config_.graph_neighbor_prefilter_keep == 0 &&
            config_.graph_cold_neighbor_count == 0 && graph_hot_indices_.empty();
-}
-
-inline bool ATMMGGraphIndex::can_use_u8_l2_light_fast_path() const {
-    return config_.graph_search_use_u8_l2 && !base_u8_.empty() &&
-           !config_.graph_search_use_quant && !config_.graph_early_stop &&
-           config_.graph_adaptive_ef_min == 0 && !config_.graph_result_margin_stop &&
-           !config_.graph_admission_bound && config_.graph_neighbor_prefilter_keep == 0 &&
-           config_.graph_cold_neighbor_count == 0 && graph_hot_indices_.empty() &&
-           graph_fixed_neighbor_count_ > 0 && !graph_fixed_indices_.empty();
 }
 
 inline std::vector<PID> ATMMGGraphIndex::search_exact_l2_light_with_stats(
@@ -814,9 +796,9 @@ inline std::vector<PID> ATMMGGraphIndex::search_exact_l2_light_with_stats(
         ++local_stats.fallback_count;
         local_stats.fallback = true;
         local_stats.mode = SeedMode::Fallback;
-        PID fallback = center_real_pool_[best_center].empty()
+        PID fallback = center_topn_[best_center].empty()
                            ? 0
-                           : center_real_pool_[best_center][0];
+                           : center_topn_[best_center][0];
         push_id(fallback, true);
     }
 
@@ -951,9 +933,9 @@ inline std::vector<PID> ATMMGGraphIndex::search_exact_l2_light_fast(
         push_id(id);
     }
     if (candidate_queue.empty()) {
-        PID fallback = center_real_pool_[best_center].empty()
+        PID fallback = center_topn_[best_center].empty()
                            ? 0
-                           : center_real_pool_[best_center][0];
+                           : center_topn_[best_center][0];
         push_id(fallback);
     }
 
@@ -1078,9 +1060,9 @@ inline size_t ATMMGGraphIndex::search_exact_l2_light_fast_into(
         push_id(id);
     }
     if (candidate_queue.empty()) {
-        PID fallback = center_real_pool_[best_center].empty()
+        PID fallback = center_topn_[best_center].empty()
                            ? 0
-                           : center_real_pool_[best_center][0];
+                           : center_topn_[best_center][0];
         push_id(fallback);
     }
 
@@ -1136,549 +1118,6 @@ inline size_t ATMMGGraphIndex::search_exact_l2_light_fast_into(
     size_t out_count = std::min(k, seen.size());
     for (size_t i = 0; i < out_count; ++i) {
         out_ids[i] = external_id(seen[i].id);
-    }
-    return out_count;
-}
-
-inline std::vector<PID> ATMMGGraphIndex::search_u8_l2_light_fast(
-    const float* query,
-    float query_sq_norm,
-    size_t k,
-    const std::vector<PID>& seeds,
-    PID best_center,
-    float center_margin,
-    size_t ef_override
-) const {
-    const bool hard_query = is_hard_query(center_margin);
-    size_t effective_ef_max = effective_ef_for_query(query, center_margin);
-    if (!hard_query && ef_override > 0) {
-        effective_ef_max = std::max<size_t>(
-            1,
-            std::min(effective_ef_max, ef_override)
-        );
-    }
-    const size_t effective_neighbor_cap =
-        hard_query && config_.hard_query_neighbor_cap > 0
-            ? config_.hard_query_neighbor_cap
-            : config_.graph_search_neighbor_cap;
-    const size_t effective_late_neighbor_cap =
-        hard_query && config_.hard_query_late_neighbor_cap > 0
-            ? config_.hard_query_late_neighbor_cap
-            : config_.graph_late_neighbor_cap;
-    const size_t effective_late_neighbor_after =
-        hard_query && config_.hard_query_late_neighbor_after > 0
-            ? config_.hard_query_late_neighbor_after
-            : config_.graph_late_neighbor_after;
-
-    size_t base_neighbor_limit = effective_neighbor_cap == 0
-                                     ? graph_fixed_neighbor_count_
-                                     : effective_neighbor_cap;
-    base_neighbor_limit = std::min(base_neighbor_limit, graph_fixed_neighbor_count_);
-    if (base_neighbor_limit == 0) {
-        return {};
-    }
-
-    std::array<uint8_t, 256> query_u8_stack{};
-    std::vector<uint8_t> query_u8_heap;
-    const uint8_t* query_u8_data = nullptr;
-    if (dim_ <= query_u8_stack.size()) {
-        encode_query_u8_to_buffer(query, query_u8_stack.data());
-        query_u8_data = query_u8_stack.data();
-    } else {
-        encode_query_u8(query, query_u8_heap);
-        query_u8_data = query_u8_heap.data();
-    }
-
-    size_t expected_visits =
-        seeds.size() + (effective_ef_max * std::max<size_t>(1, base_neighbor_limit)) + 64;
-    uint32_t visit_epoch = next_visit_epoch();
-
-    std::vector<ScoredPid> queue_storage;
-    queue_storage.reserve(std::min(num_, expected_visits));
-    std::priority_queue<ScoredPid, std::vector<ScoredPid>, std::greater<ScoredPid>>
-        candidate_queue(std::greater<ScoredPid>(), std::move(queue_storage));
-    std::vector<ScoredPid> seen;
-    seen.reserve(std::min(num_, expected_visits));
-    const bool residual_filter_ready = residual_hash_ready();
-    std::array<float, 512> residual_prepared_query{};
-    bool residual_query_prepared = false;
-
-    size_t expansions = 0;
-    const bool use_dual_scale =
-        config_.graph_dual_scale_search &&
-        graph_dual_short_neighbor_count_ > 0 &&
-        graph_dual_long_neighbor_count_ > 0 &&
-        !graph_dual_short_indices_.empty() &&
-        !graph_dual_long_indices_.empty() &&
-        graph_dual_short_radius_.size() == num_;
-    size_t long_no_improve = 0;
-    float best_seen_distance = std::numeric_limits<float>::infinity();
-
-    auto push_id = [&](PID id) {
-        if (id >= num_ || visit_marks_[id] == visit_epoch) {
-            return false;
-        }
-        visit_marks_[id] = visit_epoch;
-        ScoredPid item{u8_l2_to_point(query_u8_data, id), id};
-        bool improved = item.distance < best_seen_distance;
-        if (improved) {
-            best_seen_distance = item.distance;
-        }
-        candidate_queue.push(item);
-        seen.push_back(item);
-        return improved;
-    };
-
-    for (PID id : seeds) {
-        push_id(id);
-    }
-    if (candidate_queue.empty()) {
-        PID fallback = center_real_pool_[best_center].empty()
-                           ? 0
-                           : center_real_pool_[best_center][0];
-        push_id(fallback);
-    }
-
-    const size_t fixed_count = graph_fixed_neighbor_count_;
-    while (!candidate_queue.empty() && expansions < effective_ef_max) {
-        ScoredPid current = candidate_queue.top();
-        candidate_queue.pop();
-        ++expansions;
-
-        const PID* neighbors =
-            graph_fixed_indices_.data() + (static_cast<size_t>(current.id) * fixed_count);
-        size_t available_neighbors = graph_fixed_counts_[current.id];
-        bool scan_long_edges = false;
-        if (use_dual_scale && graph_dual_long_counts_[current.id] > 0 &&
-            long_no_improve <= config_.graph_dual_long_no_improve_limit) {
-            float radius = graph_dual_short_radius_[current.id];
-            float u8_radius = graph_dual_short_u8_radius_.empty()
-                                  ? 0.0F
-                                  : graph_dual_short_u8_radius_[current.id];
-            if (u8_radius > 0.0F) {
-                scan_long_edges =
-                    current.distance > u8_radius * config_.graph_dual_query_beta;
-            } else if (radius > 0.0F) {
-                float exact_current = l2_to_point(query, query_sq_norm, current.id);
-                scan_long_edges =
-                    exact_current > radius * config_.graph_dual_query_beta;
-            }
-        }
-        float before_best = best_seen_distance;
-        size_t neighbor_budget = base_neighbor_limit;
-        if (effective_late_neighbor_cap > 0 &&
-            effective_late_neighbor_after > 0 &&
-            expansions > effective_late_neighbor_after) {
-            neighbor_budget = std::min(neighbor_budget, effective_late_neighbor_cap);
-        }
-        size_t neighbor_limit = std::min<size_t>(available_neighbors, neighbor_budget);
-        std::array<PID, 128> accepted{};
-        size_t accepted_count = 0;
-        bool used_residual_filter =
-            !use_dual_scale &&
-            residual_filter_ready &&
-            (config_.residual_hash_filter_after == 0 ||
-             expansions > config_.residual_hash_filter_after) &&
-            !graph_offsets_.empty() && neighbor_limit > 0 &&
-            neighbor_limit <= accepted.size();
-        size_t edge_begin = 0;
-        if (used_residual_filter) {
-            if (!residual_query_prepared) {
-                residual_hash_prepare_query(query, residual_prepared_query.data());
-                residual_query_prepared = true;
-            }
-            edge_begin = graph_offsets_[current.id];
-            const float* center =
-                base_.data() + (static_cast<size_t>(current.id) * dim_);
-            std::array<uint64_t, 8> query_code{};
-            residual_hash_code_from_prepared_query(
-                center, residual_prepared_query.data(), query_code.data()
-            );
-            for (size_t ni = 0; ni < neighbor_limit; ++ni) {
-                size_t pos = edge_begin + ni;
-                const uint64_t* edge_code =
-                    residual_hash_codes_.data() + (pos * residual_hash_words_);
-                if (residual_hash_pass(query_code.data(), edge_code)) {
-                    accepted[accepted_count++] = neighbors[ni];
-                }
-            }
-        }
-        if (used_residual_filter && accepted_count > 0) {
-            for (size_t i = 0; i < accepted_count; ++i) {
-                push_id(accepted[i]);
-            }
-        } else {
-            for (size_t ni = 0; ni < neighbor_limit; ++ni) {
-                if (config_.graph_neighbor_prefetch > 0) {
-                    size_t pf = ni + config_.graph_neighbor_prefetch;
-                    if (pf < neighbor_limit) {
-                        prefetch_u8_point(neighbors[pf]);
-                    }
-                }
-                push_id(neighbors[ni]);
-            }
-        }
-        if (scan_long_edges && use_dual_scale &&
-            graph_dual_long_counts_[current.id] > 0) {
-            const PID* long_neighbors =
-                graph_dual_long_indices_.data() +
-                (static_cast<size_t>(current.id) * graph_dual_long_neighbor_count_);
-            size_t long_limit = graph_dual_long_counts_[current.id];
-            for (size_t ni = 0; ni < long_limit; ++ni) {
-                if (config_.graph_neighbor_prefetch > 0) {
-                    size_t pf = ni + config_.graph_neighbor_prefetch;
-                    if (pf < long_limit) {
-                        prefetch_u8_point(long_neighbors[pf]);
-                    }
-                }
-                push_id(long_neighbors[ni]);
-            }
-        }
-        if (scan_long_edges) {
-            if (best_seen_distance < before_best) {
-                long_no_improve = 0;
-            } else {
-                ++long_no_improve;
-            }
-        }
-    }
-
-    size_t rerank_keep = std::min(seen.size(), k);
-    keep_smallest(seen, rerank_keep);
-    rerank_keep = apply_final_prefilter(query, k, seen, rerank_keep);
-
-    constexpr size_t kStackExactScoresLimit = 256;
-    if (rerank_keep <= kStackExactScoresLimit) {
-        std::array<ScoredPid, kStackExactScoresLimit> exact_scores{};
-        for (size_t i = 0; i < rerank_keep; ++i) {
-            exact_scores[i] = {l2_to_point(query, query_sq_norm, seen[i].id), seen[i].id};
-        }
-        size_t out_count = std::min(k, rerank_keep);
-        if (out_count < rerank_keep) {
-            auto nth = exact_scores.begin() + static_cast<std::ptrdiff_t>(out_count);
-            std::nth_element(exact_scores.begin(), nth, exact_scores.begin() + rerank_keep);
-        }
-        std::sort(exact_scores.begin(), exact_scores.begin() + out_count);
-        if (!hard_query && config_.hard_query_fallback &&
-            config_.hard_query_result_margin > 0.0F && out_count == k &&
-            rerank_keep > k && k > 0) {
-            float kth = std::max(exact_scores[out_count - 1].distance, 1e-6F);
-            float margin = (exact_scores[out_count].distance -
-                            exact_scores[out_count - 1].distance) /
-                           kth;
-            if (margin < config_.hard_query_result_margin) {
-                return search_u8_l2_light_fast(
-                    query, query_sq_norm, k, seeds, best_center, -1.0F
-                );
-            }
-        }
-        std::vector<PID> result;
-        result.reserve(out_count);
-        for (size_t i = 0; i < out_count; ++i) {
-            result.push_back(external_id(exact_scores[i].id));
-        }
-        return result;
-    }
-
-    std::vector<ScoredPid> exact_scores;
-    exact_scores.reserve(rerank_keep);
-    for (size_t i = 0; i < rerank_keep; ++i) {
-        exact_scores.push_back(
-            {l2_to_point(query, query_sq_norm, seen[i].id), seen[i].id}
-        );
-    }
-    if (!hard_query && config_.hard_query_fallback &&
-        config_.hard_query_result_margin > 0.0F && exact_scores.size() > k &&
-        k > 0) {
-        auto next = exact_scores.begin() + static_cast<std::ptrdiff_t>(k);
-        std::nth_element(exact_scores.begin(), next, exact_scores.end());
-        auto kth = exact_scores.begin() + static_cast<std::ptrdiff_t>(k - 1);
-        std::nth_element(exact_scores.begin(), kth, next);
-        float denom = std::max(kth->distance, 1e-6F);
-        float margin = (next->distance - kth->distance) / denom;
-        if (margin < config_.hard_query_result_margin) {
-            return search_u8_l2_light_fast(
-                query, query_sq_norm, k, seeds, best_center, -1.0F
-            );
-        }
-    }
-    keep_smallest(exact_scores, std::min(k, exact_scores.size()));
-
-    std::vector<PID> result;
-    result.reserve(std::min(k, exact_scores.size()));
-    for (size_t i = 0; i < std::min(k, exact_scores.size()); ++i) {
-        result.push_back(external_id(exact_scores[i].id));
-    }
-    return result;
-}
-
-inline size_t ATMMGGraphIndex::search_u8_l2_light_fast_into(
-    const float* query,
-    float query_sq_norm,
-    size_t k,
-    const std::vector<PID>& seeds,
-    PID best_center,
-    float center_margin,
-    PID* out_ids,
-    size_t ef_override
-) const {
-    const bool hard_query = is_hard_query(center_margin);
-    size_t effective_ef_max = effective_ef_for_query(query, center_margin);
-    if (!hard_query && ef_override > 0) {
-        effective_ef_max = std::max<size_t>(
-            1,
-            std::min(effective_ef_max, ef_override)
-        );
-    }
-    const size_t effective_neighbor_cap =
-        hard_query && config_.hard_query_neighbor_cap > 0
-            ? config_.hard_query_neighbor_cap
-            : config_.graph_search_neighbor_cap;
-    const size_t effective_late_neighbor_cap =
-        hard_query && config_.hard_query_late_neighbor_cap > 0
-            ? config_.hard_query_late_neighbor_cap
-            : config_.graph_late_neighbor_cap;
-    const size_t effective_late_neighbor_after =
-        hard_query && config_.hard_query_late_neighbor_after > 0
-            ? config_.hard_query_late_neighbor_after
-            : config_.graph_late_neighbor_after;
-
-    size_t base_neighbor_limit = effective_neighbor_cap == 0
-                                     ? graph_fixed_neighbor_count_
-                                     : effective_neighbor_cap;
-    base_neighbor_limit = std::min(base_neighbor_limit, graph_fixed_neighbor_count_);
-    if (base_neighbor_limit == 0) {
-        return 0;
-    }
-
-    std::array<uint8_t, 256> query_u8_stack{};
-    std::vector<uint8_t> query_u8_heap;
-    const uint8_t* query_u8_data = nullptr;
-    if (dim_ <= query_u8_stack.size()) {
-        encode_query_u8_to_buffer(query, query_u8_stack.data());
-        query_u8_data = query_u8_stack.data();
-    } else {
-        encode_query_u8(query, query_u8_heap);
-        query_u8_data = query_u8_heap.data();
-    }
-
-    size_t expected_visits =
-        seeds.size() + (effective_ef_max * std::max<size_t>(1, base_neighbor_limit)) + 64;
-    uint32_t visit_epoch = next_visit_epoch();
-
-    std::vector<ScoredPid> queue_storage;
-    queue_storage.reserve(std::min(num_, expected_visits));
-    std::priority_queue<ScoredPid, std::vector<ScoredPid>, std::greater<ScoredPid>>
-        candidate_queue(std::greater<ScoredPid>(), std::move(queue_storage));
-    std::vector<ScoredPid> seen;
-    seen.reserve(std::min(num_, expected_visits));
-    const bool residual_filter_ready = residual_hash_ready();
-    std::array<float, 512> residual_prepared_query{};
-    bool residual_query_prepared = false;
-
-    size_t expansions = 0;
-    const bool use_dual_scale =
-        config_.graph_dual_scale_search &&
-        graph_dual_short_neighbor_count_ > 0 &&
-        graph_dual_long_neighbor_count_ > 0 &&
-        !graph_dual_short_indices_.empty() &&
-        !graph_dual_long_indices_.empty() &&
-        graph_dual_short_radius_.size() == num_;
-    size_t long_no_improve = 0;
-    float best_seen_distance = std::numeric_limits<float>::infinity();
-
-    auto push_id = [&](PID id) {
-        if (id >= num_ || visit_marks_[id] == visit_epoch) {
-            return false;
-        }
-        visit_marks_[id] = visit_epoch;
-        ScoredPid item{u8_l2_to_point(query_u8_data, id), id};
-        bool improved = item.distance < best_seen_distance;
-        if (improved) {
-            best_seen_distance = item.distance;
-        }
-        candidate_queue.push(item);
-        seen.push_back(item);
-        return improved;
-    };
-
-    for (PID id : seeds) {
-        push_id(id);
-    }
-    if (candidate_queue.empty()) {
-        PID fallback = center_real_pool_[best_center].empty()
-                           ? 0
-                           : center_real_pool_[best_center][0];
-        push_id(fallback);
-    }
-
-    const size_t fixed_count = graph_fixed_neighbor_count_;
-    while (!candidate_queue.empty() && expansions < effective_ef_max) {
-        ScoredPid current = candidate_queue.top();
-        candidate_queue.pop();
-        ++expansions;
-
-        const PID* neighbors =
-            graph_fixed_indices_.data() + (static_cast<size_t>(current.id) * fixed_count);
-        size_t available_neighbors = graph_fixed_counts_[current.id];
-        bool scan_long_edges = false;
-        if (use_dual_scale && graph_dual_long_counts_[current.id] > 0 &&
-            long_no_improve <= config_.graph_dual_long_no_improve_limit) {
-            float radius = graph_dual_short_radius_[current.id];
-            float u8_radius = graph_dual_short_u8_radius_.empty()
-                                  ? 0.0F
-                                  : graph_dual_short_u8_radius_[current.id];
-            if (u8_radius > 0.0F) {
-                scan_long_edges =
-                    current.distance > u8_radius * config_.graph_dual_query_beta;
-            } else if (radius > 0.0F) {
-                float exact_current = l2_to_point(query, query_sq_norm, current.id);
-                scan_long_edges =
-                    exact_current > radius * config_.graph_dual_query_beta;
-            }
-        }
-        float before_best = best_seen_distance;
-        size_t neighbor_budget = base_neighbor_limit;
-        if (effective_late_neighbor_cap > 0 &&
-            effective_late_neighbor_after > 0 &&
-            expansions > effective_late_neighbor_after) {
-            neighbor_budget = std::min(neighbor_budget, effective_late_neighbor_cap);
-        }
-        size_t neighbor_limit = std::min<size_t>(available_neighbors, neighbor_budget);
-
-        std::array<PID, 128> accepted{};
-        size_t accepted_count = 0;
-        bool used_residual_filter =
-            !use_dual_scale &&
-            residual_filter_ready &&
-            (config_.residual_hash_filter_after == 0 ||
-             expansions > config_.residual_hash_filter_after) &&
-            !graph_offsets_.empty() && neighbor_limit > 0 &&
-            neighbor_limit <= accepted.size();
-        size_t edge_begin = 0;
-        if (used_residual_filter) {
-            if (!residual_query_prepared) {
-                residual_hash_prepare_query(query, residual_prepared_query.data());
-                residual_query_prepared = true;
-            }
-            edge_begin = graph_offsets_[current.id];
-            const float* center =
-                base_.data() + (static_cast<size_t>(current.id) * dim_);
-            std::array<uint64_t, 8> query_code{};
-            residual_hash_code_from_prepared_query(
-                center, residual_prepared_query.data(), query_code.data()
-            );
-            for (size_t ni = 0; ni < neighbor_limit; ++ni) {
-                size_t pos = edge_begin + ni;
-                const uint64_t* edge_code =
-                    residual_hash_codes_.data() + (pos * residual_hash_words_);
-                if (residual_hash_pass(query_code.data(), edge_code)) {
-                    accepted[accepted_count++] = neighbors[ni];
-                }
-            }
-        }
-        if (used_residual_filter && accepted_count > 0) {
-            for (size_t i = 0; i < accepted_count; ++i) {
-                push_id(accepted[i]);
-            }
-        } else {
-            for (size_t ni = 0; ni < neighbor_limit; ++ni) {
-                if (config_.graph_neighbor_prefetch > 0) {
-                    size_t pf = ni + config_.graph_neighbor_prefetch;
-                    if (pf < neighbor_limit) {
-                        prefetch_u8_point(neighbors[pf]);
-                    }
-                }
-                push_id(neighbors[ni]);
-            }
-        }
-        if (scan_long_edges && use_dual_scale &&
-            graph_dual_long_counts_[current.id] > 0) {
-            const PID* long_neighbors =
-                graph_dual_long_indices_.data() +
-                (static_cast<size_t>(current.id) * graph_dual_long_neighbor_count_);
-            size_t long_limit = graph_dual_long_counts_[current.id];
-            for (size_t ni = 0; ni < long_limit; ++ni) {
-                if (config_.graph_neighbor_prefetch > 0) {
-                    size_t pf = ni + config_.graph_neighbor_prefetch;
-                    if (pf < long_limit) {
-                        prefetch_u8_point(long_neighbors[pf]);
-                    }
-                }
-                push_id(long_neighbors[ni]);
-            }
-        }
-        if (scan_long_edges) {
-            if (best_seen_distance < before_best) {
-                long_no_improve = 0;
-            } else {
-                ++long_no_improve;
-            }
-        }
-    }
-
-    size_t rerank_keep = std::min(seen.size(), k);
-    keep_smallest(seen, rerank_keep);
-    rerank_keep = apply_final_prefilter(query, k, seen, rerank_keep);
-
-    constexpr size_t kStackExactScoresLimit = 256;
-    if (rerank_keep <= kStackExactScoresLimit) {
-        std::array<ScoredPid, kStackExactScoresLimit> exact_scores{};
-        for (size_t i = 0; i < rerank_keep; ++i) {
-            exact_scores[i] = {l2_to_point(query, query_sq_norm, seen[i].id), seen[i].id};
-        }
-        size_t out_count = std::min(k, rerank_keep);
-        if (out_count < rerank_keep) {
-            auto nth = exact_scores.begin() + static_cast<std::ptrdiff_t>(out_count);
-            std::nth_element(exact_scores.begin(), nth, exact_scores.begin() + rerank_keep);
-        }
-        std::sort(exact_scores.begin(), exact_scores.begin() + out_count);
-        if (!hard_query && config_.hard_query_fallback &&
-            config_.hard_query_result_margin > 0.0F && out_count == k &&
-            rerank_keep > k && k > 0) {
-            float kth = std::max(exact_scores[out_count - 1].distance, 1e-6F);
-            float margin = (exact_scores[out_count].distance -
-                            exact_scores[out_count - 1].distance) /
-                           kth;
-            if (margin < config_.hard_query_result_margin) {
-                return search_u8_l2_light_fast_into(
-                    query, query_sq_norm, k, seeds, best_center, -1.0F, out_ids
-                );
-            }
-        }
-        for (size_t i = 0; i < out_count; ++i) {
-            out_ids[i] = external_id(exact_scores[i].id);
-        }
-        return out_count;
-    }
-
-    std::vector<ScoredPid> exact_scores;
-    exact_scores.reserve(rerank_keep);
-    for (size_t i = 0; i < rerank_keep; ++i) {
-        exact_scores.push_back(
-            {l2_to_point(query, query_sq_norm, seen[i].id), seen[i].id}
-        );
-    }
-    if (!hard_query && config_.hard_query_fallback &&
-        config_.hard_query_result_margin > 0.0F && exact_scores.size() > k &&
-        k > 0) {
-        auto next = exact_scores.begin() + static_cast<std::ptrdiff_t>(k);
-        std::nth_element(exact_scores.begin(), next, exact_scores.end());
-        auto kth = exact_scores.begin() + static_cast<std::ptrdiff_t>(k - 1);
-        std::nth_element(exact_scores.begin(), kth, next);
-        float denom = std::max(kth->distance, 1e-6F);
-        float margin = (next->distance - kth->distance) / denom;
-        if (margin < config_.hard_query_result_margin) {
-            return search_u8_l2_light_fast_into(
-                query, query_sq_norm, k, seeds, best_center, -1.0F, out_ids
-            );
-        }
-    }
-    keep_smallest(exact_scores, std::min(k, exact_scores.size()));
-
-    size_t out_count = std::min(k, exact_scores.size());
-    for (size_t i = 0; i < out_count; ++i) {
-        out_ids[i] = external_id(exact_scores[i].id);
     }
     return out_count;
 }
@@ -1739,9 +1178,9 @@ inline std::vector<PID> ATMMGGraphIndex::search_fast(
     float best_center_dist2 = l2_to_center(query, best_center);
 
     std::vector<PID> seeds;
-    if (best_center < center_real_pool_.size()) {
-        const auto& pool = center_real_pool_[best_center];
-        size_t take = std::min(config_.center_real_pool_take, pool.size());
+    if (best_center < center_topn_.size()) {
+        const auto& pool = center_topn_[best_center];
+        size_t take = std::min(config_.center_topn_coarse_keep, pool.size());
         seeds.assign(pool.begin(), pool.begin() + static_cast<std::ptrdiff_t>(take));
     }
     if (seeds.empty()) {
@@ -1751,13 +1190,6 @@ inline std::vector<PID> ATMMGGraphIndex::search_fast(
     if (can_use_exact_l2_light_fast_path()) {
         return search_exact_l2_light_fast(query, k, seeds, best_center);
     }
-    if (can_use_u8_l2_light_fast_path()) {
-        return search_u8_l2_light_fast(
-            query, query_sq_norm, k, seeds, best_center, center_margin,
-            bucket_ef_override
-        );
-    }
-
     std::vector<float> center_query_dist2;
     std::vector<float> center_query_norm;
     bool use_admission_bound =
@@ -1784,12 +1216,6 @@ inline std::vector<PID> ATMMGGraphIndex::search_fast(
             center_query_norm[best_center] = std::sqrt(std::max(best_center_dist2, 0.0F));
         }
     }
-    std::vector<uint8_t> query_u8;
-    if (config_.graph_search_use_u8_l2 && !base_u8_.empty() &&
-        !config_.graph_search_use_quant) {
-        encode_query_u8(query, query_u8);
-    }
-
     auto ensure_center_query_distance = [&](PID center_id) {
         if (center_query_dist2.empty()) {
             return;
@@ -1803,9 +1229,6 @@ inline std::vector<PID> ATMMGGraphIndex::search_fast(
 
     auto graph_distance = [&](PID id) {
         if (!config_.graph_search_use_quant) {
-            if (!query_u8.empty()) {
-                return u8_l2_to_point(query_u8.data(), id);
-            }
             return l2_to_point(query, query_sq_norm, id);
         }
         PID center_id = point_center_[id];
@@ -1880,7 +1303,7 @@ inline std::vector<PID> ATMMGGraphIndex::search_fast(
     }
 
     if (candidate_queue.empty()) {
-        PID fallback = center_real_pool_[best_center].empty() ? 0 : center_real_pool_[best_center][0];
+        PID fallback = center_topn_[best_center].empty() ? 0 : center_topn_[best_center][0];
         visit_marks_[fallback] = visit_epoch;
         float dist = graph_distance(fallback);
         candidate_queue.push({dist, fallback});
@@ -1931,8 +1354,7 @@ inline std::vector<PID> ATMMGGraphIndex::search_fast(
     bool use_neighbor_prefilter =
         config_.graph_neighbor_prefilter_keep > 0 && !graph_prefilter_dims_.empty();
     bool use_result_margin_stop =
-        config_.graph_result_margin_stop && !config_.graph_search_use_quant &&
-        query_u8.empty();
+        config_.graph_result_margin_stop && !config_.graph_search_use_quant;
     std::vector<ScoredPid> neighbor_prefilter;
     if (use_neighbor_prefilter) {
         size_t reserve_cap = effective_neighbor_cap == 0
@@ -2223,7 +1645,7 @@ inline std::vector<PID> ATMMGGraphIndex::search_fast(
     }
 
     std::vector<PID> result;
-    bool needs_exact_rerank = config_.graph_search_use_quant || !query_u8.empty();
+    bool needs_exact_rerank = config_.graph_search_use_quant;
     if (needs_exact_rerank) {
         size_t rerank_keep = std::min(seen.size(), k);
         keep_smallest(seen, rerank_keep);
@@ -2261,8 +1683,7 @@ inline size_t ATMMGGraphIndex::search_fast_into(
     const float* query, size_t k, PID* out_ids
 ) const {
     const bool use_exact_l2_light = can_use_exact_l2_light_fast_path();
-    const bool use_u8_l2_light = can_use_u8_l2_light_fast_path();
-    if (!use_exact_l2_light && !use_u8_l2_light) {
+    if (!use_exact_l2_light) {
         std::vector<PID> ids = search_fast(query, k);
         size_t out_count = std::min(k, ids.size());
         for (size_t i = 0; i < out_count; ++i) {
@@ -2323,23 +1744,17 @@ inline size_t ATMMGGraphIndex::search_fast_into(
     }
 
     std::vector<PID> seeds;
-    if (best_center < center_real_pool_.size()) {
-        const auto& pool = center_real_pool_[best_center];
-        size_t take = std::min(config_.center_real_pool_take, pool.size());
+    if (best_center < center_topn_.size()) {
+        const auto& pool = center_topn_[best_center];
+        size_t take = std::min(config_.center_topn_coarse_keep, pool.size());
         seeds.assign(pool.begin(), pool.begin() + static_cast<std::ptrdiff_t>(take));
     }
     if (seeds.empty()) {
         seeds.push_back(0);
     }
-    const size_t bucket_ef_override = 0;
     if (use_exact_l2_light) {
         return search_exact_l2_light_fast_into(query, k, seeds, best_center, out_ids);
     }
-    if (use_u8_l2_light) {
-        return search_u8_l2_light_fast_into(
-            query, query_sq_norm, k, seeds, best_center, center_margin, out_ids,
-            bucket_ef_override
-        );
-    }
     return 0;
 }
+

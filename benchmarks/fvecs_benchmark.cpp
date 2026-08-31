@@ -219,8 +219,6 @@ void force_mainline_only(ATMMG::Config& config) {
     config.use_residual_hash_bucket_graph = false;
     config.graph_search_use_quant = false;
     config.graph_search_full_quant = false;
-    config.graph_search_use_u8_l2 = false;
-    config.graph_build_use_u8_l2 = false;
     config.graph_early_stop = false;
     config.graph_result_margin_stop = false;
     config.graph_admission_bound = false;
@@ -270,11 +268,6 @@ void apply_env_overrides(ATMMG::Config& config, bool& print_details) {
     env_u64("ATMMG_CENTER_TOPN_PROBE", config.center_topn_probe);
     env_u64("ATMMG_CENTER_TOPN_COARSE_KEEP", config.center_topn_coarse_keep);
     env_u64("ATMMG_INIT_KEEP", config.init_keep);
-    env_u64("ATMMG_CENTER_REAL_POOL_SIZE", config.center_real_pool_size);
-    env_u64("ATMMG_CENTER_REAL_POOL_TAKE", config.center_real_pool_take);
-    env_u64("ATMMG_CENTER_REAL_POOL_TRIGGER_TOPK", config.center_real_pool_trigger_topk);
-    env_bool("ATMMG_CENTER_REAL_POOL_MONOTONIC", config.center_real_pool_monotonic);
-    env_bool("ATMMG_CENTER_REAL_POOL_FORCE", config.center_real_pool_force);
     env_bool("ATMMG_GRAPH_BUILD_BRIDGE_EDGES", config.graph_build_bridge_edges);
     env_u64("ATMMG_GRAPH_BRIDGE_CENTER_NEIGHBORS", config.graph_bridge_center_neighbors);
     env_u64("ATMMG_GRAPH_BRIDGE_POINTS_PER_CENTER", config.graph_bridge_points_per_center);
@@ -282,8 +275,6 @@ void apply_env_overrides(ATMMG::Config& config, bool& print_details) {
     env_bool("ATMMG_GRAPH_QUERY_ADJACENCY_ORDER", config.graph_query_adjacency_order);
     env_bool("ATMMG_GRAPH_QUERY_FRONT_PRUNE", config.graph_query_front_prune);
     env_bool("ATMMG_GRAPH_REORDER_BY_CENTER", config.graph_reorder_by_center);
-    env_bool("ATMMG_GRAPH_BUILD_USE_U8_L2", config.graph_build_use_u8_l2);
-    env_bool("ATMMG_GRAPH_SEARCH_USE_U8_L2", config.graph_search_use_u8_l2);
     env_bool("ATMMG_GRAPH_POST_NND_REFINE", config.graph_post_nnd_refine);
     env_u64("ATMMG_GRAPH_POST_NND_ITERATIONS", config.graph_post_nnd_iterations);
     env_u64(
@@ -295,13 +286,7 @@ void apply_env_overrides(ATMMG::Config& config, bool& print_details) {
         "ATMMG_GRAPH_POST_NND_PRESERVE_DEGREE",
         config.graph_post_nnd_preserve_degree
     );
-    env_float("ATMMG_GRAPH_U8_CLIP_LOW_PERCENTILE", config.graph_u8_clip_low_percentile);
-    env_float("ATMMG_GRAPH_U8_CLIP_HIGH_PERCENTILE", config.graph_u8_clip_high_percentile);
-    env_u64("ATMMG_GRAPH_U8_CLIP_SAMPLE_SIZE", config.graph_u8_clip_sample_size);
-
     config.center_topn_scan = 0;
-    config.center_real_pool_monotonic = true;
-    config.center_real_pool_force = true;
 }
 
 void apply_common_args(
@@ -390,9 +375,6 @@ void apply_common_args(
     if (argc > 42) {
         config.graph_early_stop_slack = static_cast<float>(std::atof(argv[42]));
     }
-    if (argc > 43) {
-        config.graph_search_use_u8_l2 = std::strtoull(argv[43], nullptr, 10) != 0;
-    }
     if (argc > 44) {
         config.graph_query_front_prune = std::strtoull(argv[44], nullptr, 10) != 0;
     }
@@ -468,11 +450,6 @@ int main(int argc, char** argv) {
     config.center_coarse_projection_dims = 24;
     config.center_coarse_keep = 512;
     config.center_entry_mode = ATMMG::CenterEntryMode::TreeOnly;
-    config.center_real_pool_size = 256;
-    config.center_real_pool_take = 48;
-    config.center_real_pool_trigger_topk = 100;
-    config.center_real_pool_monotonic = true;
-    config.center_real_pool_force = true;
     config.center_topn_scan = 0;
     config.center_topn_coarse_keep = 64;
     config.init_keep = 32;
@@ -491,7 +468,6 @@ int main(int argc, char** argv) {
     config.graph_build_cross_candidates = 256;
     config.graph_build_projection_dims = 6;
     config.graph_build_center_neighbors = 8;
-    config.graph_search_use_u8_l2 = false;
     config.random_seed = random_seed;
 
     bool use_fast_query = true;
@@ -536,16 +512,6 @@ int main(int argc, char** argv) {
     std::cout << "groundtruth_path=" << (has_groundtruth ? groundtruth_path : "(none)") << '\n';
     std::cout << "create=" << create_ms << " ms\n";
     std::cout << "query_fast_path=" << (use_fast_query ? 1 : 0) << '\n';
-    std::cout << "graph_search_use_u8_l2=" << (index.config().graph_search_use_u8_l2 ? 1 : 0)
-              << '\n';
-    std::cout << "graph_build_use_u8_l2=" << (index.config().graph_build_use_u8_l2 ? 1 : 0)
-              << '\n';
-    std::cout << "graph_u8_clip_low_percentile="
-              << index.config().graph_u8_clip_low_percentile << '\n';
-    std::cout << "graph_u8_clip_high_percentile="
-              << index.config().graph_u8_clip_high_percentile << '\n';
-    std::cout << "graph_u8_clip_sample_size="
-              << index.config().graph_u8_clip_sample_size << '\n';
     if (!csv_path.empty()) {
         std::cout << "output_csv=" << csv_path << '\n';
     }
@@ -633,16 +599,6 @@ int main(int argc, char** argv) {
         std::cout << "ef_search=" << effective_config.ef_search << '\n';
         std::cout << "graph_search_neighbor_cap="
                   << effective_config.graph_search_neighbor_cap << '\n';
-        std::cout << "graph_search_use_u8_l2="
-                  << (effective_config.graph_search_use_u8_l2 ? 1 : 0) << '\n';
-        std::cout << "graph_build_use_u8_l2="
-                  << (effective_config.graph_build_use_u8_l2 ? 1 : 0) << '\n';
-        std::cout << "graph_u8_clip_low_percentile="
-                  << effective_config.graph_u8_clip_low_percentile << '\n';
-        std::cout << "graph_u8_clip_high_percentile="
-                  << effective_config.graph_u8_clip_high_percentile << '\n';
-        std::cout << "graph_u8_clip_sample_size="
-                  << effective_config.graph_u8_clip_sample_size << '\n';
     }
 
     return 0;
