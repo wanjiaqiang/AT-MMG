@@ -1,20 +1,19 @@
-# ATMMG
+# AT-MMG
 
-ATMMG is a C++ prototype for graph-based approximate nearest neighbor
-search with trace-derived shortcut edges. The current research branch keeps the
-plain L2/u8 graph search path and the shortcut construction path used in local
-Fashion-MNIST experiments; older experimental benchmark targets are no longer
-part of the build.
+AT-MMG (Axis-Tree-Guided Multi-Entry Monotonic Graph) is a two-stage
+approximate nearest neighbor search framework. It first uses an axis tree to
+anchor a query to a local partition, and then performs high-recall graph
+search from the corresponding entry set in a multi-entry monotonic graph. The
+design couples tree-based localization with graph-based refinement to shorten
+search paths while preserving accuracy.
 
 ## Layout
 
 - `include/ATMMG/ATMMG.hpp` provides the public include entry.
 - `include/ATMMG/index/ATMMG_graph/` contains the internal index
   implementation, split into focused implementation fragments under `detail/`.
-- `benchmarks/` contains local benchmark drivers for HDF5 datasets and fvecs
+- `benchmarks/` contains benchmark drivers for HDF5 datasets and fvecs
   datasets.
-- `bin/`, `build*/`, `logs/`, datasets, and temporary experiment outputs are
-  ignored by git.
 
 ## Build
 
@@ -32,5 +31,4 @@ The HDF5 benchmark is built only when CMake can find the HDF5 C++ package.
 .\bin\Release\ATMMG_fvecs_benchmark.exe base.fvecs query.fvecs 1000000 10000
 ```
 
-Shortcut-related runtime environment variables use the `ATMMG_` prefix,
-for example `ATMMG_TRACE_DEPTH_SHORTCUTS=1`.
+AT-MMG runtime environment variables use the `ATMMG_` prefix.
